@@ -1,0 +1,379 @@
+"""
+wpt_csv_filler_v2.py
+─────────────────────────────────────────────────────────────────
+Matches your exact CSV structure:
+  conic_curve_mm | x_cord | y_cord | angle | temp | Vin |
+  Vout | Cin | Cout | S21_param | inductance | efficiency
+
+Frequency splitting analysis included.
+Temperature held constant at 75°C (affects wire resistance).
+
+Usage:
+    python wpt_csv_filler_v2.py input.csv output.csv
+    python wpt_csv_filler_v2.py --template my_data.csv
+"""
+
+import csv
+import sys
+import os
+import argparse
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wpt_simulation import CoilParams, WPTSystem, Pose2D
+
+# ─────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────
+FREQ        = 6.78e6    # Hz
+V_IN        = 12.0      # V  — from your CSV
+D_AXIAL_MM  = 50.0      # mm — fixed axial separation
+TEMP_C      = 75.0      # °C — constant temperature
+
+# Temperature correction for copper resistivity
+# rho(T) = rho_20 * (1 + alpha*(T-20))
+# alpha_cu = 0.00393 per °C
+RHO_CU_20   = 1.68e-8
+ALPHA_CU    = 0.00393
+RHO_CU_T    = RHO_CU_20 * (1 + ALPHA_CU * (TEMP_C - 20))
+TEMP_FACTOR = RHO_CU_T / RHO_CU_20  # ~1.217 at 75°C
+
+# ─────────────────────────────────────────────────────────────
+# CSV COLUMN DEFINITIONS — matching your exact structure
+# ─────────────────────────────────────────────────────────────
+
+# Input columns you fill in manually
+INPUT_COLS = [
+    'conic_curve_mm',   # curvature height (mm)
+    'x_cord',           # X lateral offset (mm)
+    'y_cord',           # Y lateral offset (mm)
+    'angle',            # angular misalignment (degrees)
+    'temp',             # temperature (°C) — kept constant at 75
+    'Vin',              # input voltage (V)
+]
+
+# Simulation output columns
+SIM_COLS = [
+    'Vout',             # simulated output voltage (V)
+    'Cin',              # Tx resonant capacitance (pF)
+    'Cout',             # Rx resonant capacitance (pF)
+    'S21_param',        # S21 forward transmission (dB)
+    'inductance',       # Rx coil inductance (µH)
+    'efficiency',       # power transfer efficiency (%)
+
+    # Extended metrics
+    'L_tx_uH',          # Tx inductance (µH)
+    'M_nH',             # mutual inductance (nH)
+    'k',                # coupling coefficient
+    'kQ',               # k * sqrt(Q_tx * Q_rx)
+    'Q_tx',             # Tx Q factor
+    'Q_rx',             # Rx Q factor
+    'S11_dB',           # Tx return loss (dB)
+    'S22_dB',           # Rx return loss (dB)
+    'S12_dB',           # reverse transmission (dB) = S21
+    'P_in_W',           # input power (W)
+    'P_out_W',          # output power (W)
+    'f_split_low_MHz',  # lower split frequency (MHz) — NaN if no split
+    'f_split_high_MHz', # upper split frequency (MHz) — NaN if no split
+    'split_gap_kHz',    # frequency split gap (kHz) — 0 if no split
+    'coupling_regime',  # 'undercoupled', 'critical', 'overcoupled'
+    'd_lateral_mm',     # total lateral offset magnitude (mm)
+]
+
+# Columns left blank for manual measurement entry
+MANUAL_COLS = [
+    'Vout_measured',
+    'efficiency_measured',
+    'notes',
+]
+
+ALL_COLS = INPUT_COLS + SIM_COLS + MANUAL_COLS
+
+
+# ─────────────────────────────────────────────────────────────
+# FREQUENCY SPLITTING ANALYSIS
+# ─────────────────────────────────────────────────────────────
+
+def frequency_splitting(k, Q_tx, Q_rx, f0=FREQ):
+    """
+    Analyze frequency splitting for given coupling and Q.
+    
+    Split condition: k > k_critical = 1/sqrt(Q_tx * Q_rx)
+    Split frequencies: f± = f0 * sqrt(1 ± k)  (approx)
+    
+    Returns:
+        f_low, f_high : split frequencies (Hz)
+        gap_kHz       : frequency gap between peaks (kHz)
+        regime        : 'undercoupled', 'critical', 'overcoupled'
+    """
+    k_crit = 1.0 / np.sqrt(Q_tx * Q_rx) if Q_tx > 0 and Q_rx > 0 else 1e9
+
+    if k < 0.95 * k_crit:
+        regime = 'undercoupled'
+        f_low  = f0
+        f_high = f0
+        gap    = 0.0
+    elif k < 1.05 * k_crit:
+        regime = 'critical'
+        f_low  = f0
+        f_high = f0
+        gap    = 0.0
+    else:
+        regime = 'overcoupled'
+        # f± = f0 / sqrt(1 ∓ k)  — exact for series resonance
+        f_low  = f0 / np.sqrt(1 + k)
+        f_high = f0 / np.sqrt(1 - k) if k < 1 else f0 * 2
+        gap    = (f_high - f_low) / 1e3  # kHz
+
+    return f_low / 1e6, f_high / 1e6, gap, regime, k_crit
+
+
+def s21_vs_frequency(k, Q_tx, Q_rx, f0=FREQ,
+                     f_min=4e6, f_max=10e6, n_pts=500):
+    """
+    Compute S21 (dB) vs frequency sweep.
+    Useful for visualizing frequency splitting.
+    Returns freq array (MHz), S21 array (dB).
+    """
+    freqs = np.linspace(f_min, f_max, n_pts)
+    s21   = np.zeros(n_pts)
+
+    for i, f in enumerate(freqs):
+        w   = 2 * np.pi * f
+        w0  = 2 * np.pi * f0
+        # Normalized detuning
+        xi  = Q_tx * (w/w0 - w0/w)
+        # S21 magnitude for series-series resonant WPT
+        denom = (1 + 1j*xi)**2 + (k * np.sqrt(Q_tx * Q_rx))**2
+        s21_lin = abs(k * np.sqrt(Q_tx * Q_rx) / denom)
+        s21[i]  = 20 * np.log10(max(s21_lin, 1e-12))
+
+    return freqs / 1e6, s21
+
+
+# ─────────────────────────────────────────────────────────────
+# SYSTEM BUILDER
+# ─────────────────────────────────────────────────────────────
+
+def build_system(h_mm, v_in=V_IN, system_cache={}):
+    """Build or retrieve cached WPTSystem for given curvature height."""
+    key = (h_mm, v_in)
+    if key not in system_cache:
+        tx = CoilParams(
+            N=12, R_outer=43e-3, R_inner=10e-3,
+            pitch=1.2e-3, wire_diam=1.024e-3,
+            curvature_h=0.0
+        )
+        rx = CoilParams(
+            N=12, R_outer=43e-3, R_inner=10e-3,
+            pitch=1.2e-3, wire_diam=1.024e-3,
+            curvature_h=h_mm * 1e-3
+        )
+        system = WPTSystem(
+            tx=tx, rx=rx,
+            freq=FREQ,
+            V_in=v_in,
+            I_in=v_in / 50.0,  # assume 50Ω source
+            d_axial=D_AXIAL_MM * 1e-3,
+        )
+        # Apply temperature correction to resistance
+        system.R_tx *= TEMP_FACTOR
+        system.R_rx *= TEMP_FACTOR
+        # Recompute Q with corrected resistance
+        system.Q_tx = system.omega * system.L_tx / system.R_tx
+        system.Q_rx = system.omega * system.L_rx / system.R_rx
+        system_cache[key] = system
+    return system_cache[key]
+
+
+# ─────────────────────────────────────────────────────────────
+# ROW PROCESSOR
+# ─────────────────────────────────────────────────────────────
+
+def process_row(row):
+    """Process one CSV row, return filled dict."""
+    h_mm    = float(row.get('conic_curve_mm', 0) or 0)
+    x_mm    = float(row.get('x_cord', 0) or 0)
+    y_mm    = float(row.get('y_cord', 0) or 0)
+    theta   = float(row.get('angle', 0) or 0)
+    v_in    = float(row.get('Vin', V_IN) or V_IN)
+    temp    = float(row.get('temp', TEMP_C) or TEMP_C)
+
+    system  = build_system(h_mm, v_in)
+    pose    = Pose2D(x=x_mm*1e-3, y=y_mm*1e-3, theta=theta)
+    result  = system.evaluate(pose)
+
+    # Frequency splitting analysis
+    f_low, f_high, gap, regime, k_crit = frequency_splitting(
+        result.k, result.Q_tx, result.Q_rx
+    )
+
+    out = {}
+
+    # Pass through input columns
+    out['conic_curve_mm'] = h_mm
+    out['x_cord']         = x_mm
+    out['y_cord']         = y_mm
+    out['angle']          = theta
+    out['temp']           = TEMP_C   # constant
+    out['Vin']            = v_in
+
+    # Core output columns matching your headers
+    out['Vout']           = round(result.V_out, 6)
+    out['Cin']            = round(result.C_tx * 1e12, 3)   # pF
+    out['Cout']           = round(result.C_rx * 1e12, 3)   # pF
+    out['S21_param']      = round(result.S21_dB, 3)        # dB
+    out['inductance']     = round(result.L_rx * 1e6, 5)    # µH (Rx)
+    out['efficiency']     = round(result.efficiency, 5)    # %
+
+    # Extended metrics
+    out['L_tx_uH']        = round(result.L_tx * 1e6, 5)
+    out['M_nH']           = round(result.M * 1e9, 5)
+    out['k']              = round(result.k, 8)
+    out['kQ']             = round(result.kQ, 5)
+    out['Q_tx']           = round(result.Q_tx, 2)
+    out['Q_rx']           = round(result.Q_rx, 2)
+    out['S11_dB']         = round(result.S11_dB, 3)
+    out['S22_dB']         = round(result.S22_dB, 3)
+    out['S12_dB']         = round(result.S12_dB, 3)
+    out['P_in_W']         = round(result.P_in, 5)
+    out['P_out_W']        = round(result.P_out, 8)
+    out['f_split_low_MHz']  = round(f_low, 4)
+    out['f_split_high_MHz'] = round(f_high, 4)
+    out['split_gap_kHz']    = round(gap, 2)
+    out['coupling_regime']  = regime
+    out['d_lateral_mm']     = round(pose.d2 * 1e3, 3)
+
+    # Blank measurement columns
+    for c in MANUAL_COLS:
+        out[c] = row.get(c, '')
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────
+# TEMPLATE GENERATOR
+# ─────────────────────────────────────────────────────────────
+
+def generate_template(path):
+    """Generate template CSV matching your exact column structure."""
+    heights = [0, 5, 10, 15, 20, 25, 30, 35, 40]
+    x_vals  = [0, 5, 10]
+    y_vals  = [0, 5, 10]
+    angles  = [0, 45, 90]
+
+    rows = []
+    for h in heights:
+        for x in x_vals:
+            for y in y_vals:
+                for a in angles:
+                    rows.append({
+                        'conic_curve_mm': h,
+                        'x_cord':         x,
+                        'y_cord':         y,
+                        'angle':          a,
+                        'temp':           '',
+                        'Vin':            12,
+                    })
+
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=ALL_COLS,
+                                extrasaction='ignore')
+        writer.writeheader()
+        for r in rows:
+            full = {c: '' for c in ALL_COLS}
+            full.update(r)
+            writer.writerow(full)
+
+    print(f"Template written: {path}")
+    print(f"  {len(rows)} rows × {len(ALL_COLS)} columns")
+    print(f"\nInput columns (fill these in):")
+    for c in INPUT_COLS:
+        print(f"  {c}")
+    print(f"\nSimulation fills:")
+    for c in SIM_COLS:
+        print(f"  {c}")
+    print(f"\nManual measurement columns (fill after experiment):")
+    for c in MANUAL_COLS:
+        print(f"  {c}")
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN FILLER
+# ─────────────────────────────────────────────────────────────
+
+def fill_csv(input_path, output_path):
+    with open(input_path, 'r', newline='') as f:
+        reader = csv.DictReader(f)
+        rows   = list(reader)
+
+    if not rows:
+        print("ERROR: CSV is empty")
+        return
+
+    print(f"Processing {len(rows)} rows...")
+    print(f"Temperature: {TEMP_C}°C (R_coil correction factor: "
+          f"{TEMP_FACTOR:.4f}x)")
+    print(f"Axial separation: {D_AXIAL_MM}mm fixed\n")
+
+    output_rows = []
+    regimes     = {'undercoupled': 0, 'critical': 0, 'overcoupled': 0}
+
+    for i, row in enumerate(rows):
+        try:
+            out = process_row(row)
+            output_rows.append(out)
+            regimes[out['coupling_regime']] = \
+                regimes.get(out['coupling_regime'], 0) + 1
+
+            if (i + 1) % 50 == 0 or i < 5:
+                print(f"  [{i+1:>4}] h={out['conic_curve_mm']}mm "
+                      f"x={out['x_cord']} y={out['y_cord']} "
+                      f"θ={out['angle']}° → "
+                      f"η={out['efficiency']:.4f}% "
+                      f"S21={out['S21_param']:.1f}dB "
+                      f"[{out['coupling_regime']}]")
+        except Exception as e:
+            print(f"  [{i+1}] ERROR: {e}")
+            output_rows.append({c: 'ERROR' for c in ALL_COLS})
+
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=ALL_COLS,
+                                extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(output_rows)
+
+    print(f"\n✓ {len(output_rows)} rows written to: {output_path}")
+    print(f"\nCoupling regime summary:")
+    for regime, count in regimes.items():
+        print(f"  {regime:<15}: {count} rows")
+
+
+# ─────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='WPT CSV filler v2 — matches your experiment CSV'
+    )
+    parser.add_argument('input',  nargs='?')
+    parser.add_argument('output', nargs='?')
+    parser.add_argument('--template', metavar='PATH')
+    args = parser.parse_args()
+
+    if args.template:
+        generate_template(args.template)
+        return
+
+    if not args.input or not args.output:
+        parser.print_help()
+        print("\nExamples:")
+        print("  python wpt_csv_filler_v2.py --template my_data.csv")
+        print("  python wpt_csv_filler_v2.py my_data.csv results.csv")
+        return
+
+    fill_csv(args.input, args.output)
+
+
+if __name__ == '__main__':
+    main()

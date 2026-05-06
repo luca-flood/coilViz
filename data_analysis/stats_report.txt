@@ -1,0 +1,119 @@
+=================================================================
+  WPT COIL CURVATURE — STATISTICAL ANALYSIS
+=================================================================
+
+Data: 9900 rows (full_model ablation only)
+Heights tested: [np.int64(0), np.int64(5), np.int64(10), np.int64(15), np.int64(20), np.int64(25), np.int64(30), np.int64(35), np.int64(40), np.int64(45), np.int64(50), np.int64(55), np.int64(60), np.int64(65), np.int64(70), np.int64(75), np.int64(80), np.int64(85)] mm
+
+─────────────────────────────────────────────────────────────────
+1. ONE-WAY ANOVA — efficiency across heights (all poses)
+─────────────────────────────────────────────────────────────────
+
+   F = 2.0638   p = 6.13e-03
+   SIGNIFICANT at α=0.05
+
+   NOTE: Low significance expected when averaging over θ=90°
+   poses where η=0 for all heights. See regression below
+   for the meaningful signal at aligned poses.
+
+─────────────────────────────────────────────────────────────────
+2. KRUSKAL-WALLIS (non-parametric)
+─────────────────────────────────────────────────────────────────
+
+   H = 15.2730   p = 5.76e-01
+   NOT SIGNIFICANT
+
+─────────────────────────────────────────────────────────────────
+3. LINEAR REGRESSION — aligned origin (x=y=0, θ=0°)
+─────────────────────────────────────────────────────────────────
+
+   Slope:     0.012354 %/mm
+   Intercept: 0.52629 %
+   R²:        0.993281
+   p-value:   8.18e-19
+   *** STRONG FIT — η increases 0.0124pp per mm of sagitta ***
+
+   At h=85mm predicted η = 1.5764%
+   vs h=0 baseline η = 0.5263%
+   Total predicted gain = 1.0501pp (199.5% relative)
+
+─────────────────────────────────────────────────────────────────
+4. EFFECT SIZE (Cohen's d) — control vs each treatment
+   < 0.2 negligible | 0.2-0.5 small | 0.5-0.8 medium | > 0.8 large
+─────────────────────────────────────────────────────────────────
+
+   h=  5mm: d = +0.0027 [negligible]
+
+   h= 10mm: d = +0.0103 [negligible]
+
+   h= 15mm: d = +0.0218 [negligible]
+
+   h= 20mm: d = +0.0355 [negligible]
+
+   h= 25mm: d = +0.0504 [negligible]
+
+   h= 30mm: d = +0.0655 [negligible]
+
+   h= 35mm: d = +0.0802 [negligible]
+
+   h= 40mm: d = +0.0940 [negligible]
+
+   h= 45mm: d = +0.1069 [negligible]
+
+   h= 50mm: d = +0.1187 [negligible]
+
+   h= 55mm: d = +0.1295 [negligible]
+
+   h= 60mm: d = +0.1393 [negligible]
+
+   h= 65mm: d = +0.1483 [negligible]
+
+   h= 70mm: d = +0.1564 [negligible]
+
+   h= 75mm: d = +0.1637 [negligible]
+
+   h= 80mm: d = +0.1704 [negligible]
+
+   h= 85mm: d = +0.1765 [negligible]
+
+─────────────────────────────────────────────────────────────────
+5. PEARSON CORRELATIONS
+─────────────────────────────────────────────────────────────────
+
+   h vs η (all poses)           r=+0.0592  p=3.76e-09  ***
+
+   k vs η                       r=+0.0610  p=1.25e-09  ***
+
+   kQ vs η                      r=+0.0488  p=1.19e-06  ***
+
+   Q_rx vs η                    r=-0.0592  p=3.80e-09  ***
+
+   d_lateral vs η               r=-0.3754  p=0.00e+00  ***
+
+   θ vs η                       r=+0.1121  p=4.84e-29  ***
+
+   h vs k                       r=-0.0293  p=3.55e-03  **
+
+─────────────────────────────────────────────────────────────────
+6. EFFICIENCY AT KEY MISALIGNMENT THRESHOLDS
+─────────────────────────────────────────────────────────────────
+
+   X=40mm, Y=0, θ=0:
+     h=  0mm: η=5.2080%
+     h= 25mm: η=6.7520%
+     h= 50mm: η=9.2500%
+     h= 85mm: η=11.7833%
+
+   X=80mm, Y=0, θ=0:
+     h=  0mm: η=0.0000%
+     h= 25mm: η=0.0000%
+     h= 50mm: η=0.0000%
+     h= 85mm: η=0.0000%
+
+   X=0, Y=0, θ=45°:
+
+   X=0, Y=0, θ=90°:
+     h=  0mm: η=0.0000%
+     h= 25mm: η=0.0000%
+     h= 50mm: η=0.0000%
+     h= 85mm: η=0.0000%
